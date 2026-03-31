@@ -16,10 +16,13 @@ export default function Home() {
   const [modelsReady, setModelsReady] = useState(false);
   const [srStatus, setSrStatus] = useState("Loading AI systems…");
   const [liveCaption, setLiveCaption] = useState("");
+  const [micHeard, setMicHeard] = useState(false);
   const modeRef = useRef<null | "deaf" | "blind">(null);
   const mutedRef = useRef(false);
   const landmarkerRef = useRef<HandLandmarker | null>(null);
   const objectDetectorRef = useRef<ObjectDetector | null>(null);
+  const speechRecognitionRef = useRef<any>(null);
+  const micPulseTimeoutRef = useRef<number | null>(null);
   const rafIdRef = useRef<number | null>(null);
   const runningRef = useRef(false);
   const lastSpokenRef = useRef<string>("");
@@ -83,6 +86,117 @@ export default function Home() {
   useEffect(() => {
     mutedRef.current = isMuted;
   }, [isMuted]);
+
+  const speakSystem = (text: string) => {
+    if (!text) return;
+    try {
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+    } catch {
+      // ignore TTS failures
+    }
+  };
+
+  const chooseMode = (nextMode: "deaf" | "blind") => {
+    // Important: update refs immediately so the rAF loop reads the correct mode
+    // even before React has flushed state updates.
+    modeRef.current = nextMode;
+    setMode(nextMode);
+
+    if (nextMode === "deaf") {
+      setIsMuted(true); // disable Speech API in deaf mode
+      setSrStatus(modelsReady ? "Sign Language mode selected." : "Loading AI systems…");
+      setLiveCaption("");
+    } else {
+      setIsMuted(false); // enable Speech API in blind mode
+      setSrStatus(modelsReady ? "Object Detection mode selected." : "Loading AI systems…");
+      setTranslation("Waiting for gesture...");
+      setConfidence(0);
+      setHandDetected(false);
+    }
+
+    // Start camera on next tick so state updates don't block.
+    setTimeout(() => {
+      startCamera();
+    }, 0);
+  };
+
+  // Voice-activated landing (blind users): listen for "blind" / "objects".
+  useEffect(() => {
+    // Safety: stop listening once a mode is selected.
+    if (mode !== null) {
+      try {
+        speechRecognitionRef.current?.stop?.();
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    const SpeechRecognitionCtor =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognitionCtor) return;
+
+    const rec = new SpeechRecognitionCtor();
+    speechRecognitionRef.current = rec;
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = "en-US";
+
+    const pulseMic = () => {
+      setMicHeard(true);
+      if (micPulseTimeoutRef.current != null) window.clearTimeout(micPulseTimeoutRef.current);
+      micPulseTimeoutRef.current = window.setTimeout(() => setMicHeard(false), 650);
+    };
+
+    rec.onresult = (event: any) => {
+      pulseMic();
+      let transcript = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const res = event.results[i];
+        const chunk = res?.[0]?.transcript;
+        if (typeof chunk === "string") transcript += ` ${chunk}`;
+      }
+      const t = transcript.toLowerCase();
+      if (t.includes("blind") || t.includes("objects") || t.includes("object")) {
+        speakSystem("Switching to Object Detection mode");
+        chooseMode("blind");
+        try {
+          rec.stop();
+        } catch {
+          // ignore
+        }
+      }
+    };
+
+    rec.onend = () => {
+      // Keep listening while on landing screen (if the browser allows it).
+      if (modeRef.current === null) {
+        try {
+          rec.start();
+        } catch {
+          // ignore (can fail without user gesture)
+        }
+      }
+    };
+
+    try {
+      rec.start();
+    } catch {
+      // ignore (some browsers block auto-start without gesture)
+    }
+
+    return () => {
+      try {
+        rec.stop();
+      } catch {
+        // ignore
+      }
+      if (micPulseTimeoutRef.current != null) window.clearTimeout(micPulseTimeoutRef.current);
+      micPulseTimeoutRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -231,7 +345,8 @@ export default function Home() {
     // Rule 1: PEACE if index tip and middle tip are close together.
     const tipDist = dist(idxTip, midTip);
     const peaceThreshold = 0.18 * diag;
-    if (tipDist < peaceThreshold) {
+    // Require index + middle to be "up" so this doesn't override folded-letter shapes.
+    if (indexUp && middleUp && tipDist < peaceThreshold) {
       const c = Math.min(1, Math.max(0, 1 - tipDist / peaceThreshold));
       return { translation: "PEACE", confidence: 0.65 + 0.35 * c, handDetected: true };
     }
@@ -513,12 +628,7 @@ export default function Home() {
             <div className="mt-6 grid grid-cols-1 gap-3">
               <button
                 type="button"
-                onClick={() => {
-                  setMode("deaf");
-                  setIsMuted(true); // disable Speech API in deaf mode
-                  setSrStatus(modelsReady ? "Sign Language mode selected." : "Loading AI systems…");
-                  startCamera();
-                }}
+                onClick={() => chooseMode("deaf")}
                 className="w-full rounded-2xl bg-gradient-to-r from-sky-500 to-blue-600 px-6 py-4 text-lg font-black shadow-lg shadow-sky-500/20 transition hover:brightness-110 active:scale-[0.99]"
                 aria-describedby="ai-ready-hint"
               >
@@ -527,12 +637,7 @@ export default function Home() {
 
               <button
                 type="button"
-                onClick={() => {
-                  setMode("blind");
-                  setIsMuted(false); // enable Speech API in blind mode
-                  setSrStatus(modelsReady ? "Object Detection mode selected." : "Loading AI systems…");
-                  startCamera();
-                }}
+                onClick={() => chooseMode("blind")}
                 onMouseEnter={() => {
                   const now = performance.now();
                   if (now - lastHoverPromptAtMsRef.current < 2000) return;
@@ -621,6 +726,13 @@ export default function Home() {
                     {isMuted ? "Unmute" : "Mute"}
                   </button>
                 </div>
+
+                {/* Microphone activity indicator (visual feedback when voice is detected) */}
+                {micHeard && (
+                  <div className="absolute left-3 top-3 grid h-10 w-10 place-items-center rounded-2xl border border-white/10 bg-black/40 backdrop-blur-md" aria-hidden="true">
+                    <div className="h-3 w-3 rounded-full bg-emerald-400 shadow-[0_0_18px_rgba(16,185,129,0.85)] animate-pulse" />
+                  </div>
+                )}
               </div>
 
               {/* Live Captions */}
@@ -665,7 +777,11 @@ export default function Home() {
                   </span>
                 </p>
                 <p className="mt-3 text-sm text-slate-200/70">
-                  Zero-latency: gesture classification happens inside the video results loop (no API call).
+                  {mode === "deaf"
+                    ? "Zero-latency: sign classification runs locally in the video loop."
+                    : mode === "blind"
+                      ? "Voice-first: object detection runs locally with smart speech guidance."
+                      : "Choose a mode to begin."}
                 </p>
               </div>
 
