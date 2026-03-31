@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useRef, useState } from 'react';
 import { HandLandmarker, FilesetResolver, ObjectDetector } from "@mediapipe/tasks-vision";
+import { Home as HomeIcon, Mic as MicIcon, Volume2 as VolumeIcon, VolumeX as VolumeOffIcon } from "lucide-react";
 
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -17,6 +18,8 @@ export default function Home() {
   const [srStatus, setSrStatus] = useState("Loading AI systems…");
   const [liveCaption, setLiveCaption] = useState("");
   const [micHeard, setMicHeard] = useState(false);
+  const [listeningEnabled, setListeningEnabled] = useState(false);
+  const [isListening, setIsListening] = useState(false);
   const modeRef = useRef<null | "deaf" | "blind">(null);
   const mutedRef = useRef(false);
   const landmarkerRef = useRef<HandLandmarker | null>(null);
@@ -67,7 +70,7 @@ export default function Home() {
           delegate: "GPU",
         },
         runningMode: "VIDEO",
-        scoreThreshold: 0.35,
+        scoreThreshold: 0.4,
         maxResults: 5,
       });
       objectDetectorRef.current = od;
@@ -97,6 +100,82 @@ export default function Home() {
     }
   };
 
+  const stopListening = () => {
+    setIsListening(false);
+    try {
+      speechRecognitionRef.current?.stop?.();
+    } catch {
+      // ignore
+    }
+  };
+
+  const startListening = () => {
+    const SpeechRecognition =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
+
+    let rec = speechRecognitionRef.current;
+    if (!rec) {
+      rec = new SpeechRecognition();
+      speechRecognitionRef.current = rec;
+      rec.continuous = true; // Auto-Restart style behavior
+      rec.interimResults = true;
+      rec.lang = "en-US";
+
+      const pulseMic = () => {
+        setMicHeard(true);
+        if (micPulseTimeoutRef.current != null) window.clearTimeout(micPulseTimeoutRef.current);
+        micPulseTimeoutRef.current = window.setTimeout(() => setMicHeard(false), 650);
+      };
+
+      rec.onresult = (event: any) => {
+        pulseMic();
+        let transcript = "";
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const res = event.results[i];
+          const chunk = res?.[0]?.transcript;
+          if (typeof chunk === "string") transcript += ` ${chunk}`;
+        }
+        const cleaned = transcript.trim();
+        if (cleaned) console.log("Speech detected:", cleaned);
+
+        const t = cleaned.toLowerCase();
+        if (t.includes("blind") || t.includes("objects") || t.includes("object")) {
+          try {
+            window.speechSynthesis.speak(new SpeechSynthesisUtterance("Switching to Object Mode"));
+          } catch {
+            // ignore
+          }
+          chooseMode("blind");
+          stopListening();
+        }
+      };
+
+      rec.onstart = () => setIsListening(true);
+      rec.onend = () => {
+        setIsListening(false);
+        // Auto-Restart while on landing + enabled
+        if (modeRef.current === null && listeningEnabled) {
+          try {
+            rec.start();
+          } catch {
+            // ignore
+          }
+        }
+      };
+      rec.onerror = () => {
+        setIsListening(false);
+      };
+    }
+
+    try {
+      rec.start();
+      setIsListening(true);
+    } catch {
+      // ignore
+    }
+  };
+
   const chooseMode = (nextMode: "deaf" | "blind") => {
     // Important: update refs immediately so the rAF loop reads the correct mode
     // even before React has flushed state updates.
@@ -121,82 +200,21 @@ export default function Home() {
     }, 0);
   };
 
-  // Voice-activated landing (blind users): listen for "blind" / "objects".
+  // Voice-activated landing (blind users): start only after user clicks Start button.
   useEffect(() => {
-    // Safety: stop listening once a mode is selected.
     if (mode !== null) {
-      try {
-        speechRecognitionRef.current?.stop?.();
-      } catch {
-        // ignore
-      }
+      stopListening();
       return;
     }
-
-    const SpeechRecognitionCtor =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognitionCtor) return;
-
-    const rec = new SpeechRecognitionCtor();
-    speechRecognitionRef.current = rec;
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.lang = "en-US";
-
-    const pulseMic = () => {
-      setMicHeard(true);
-      if (micPulseTimeoutRef.current != null) window.clearTimeout(micPulseTimeoutRef.current);
-      micPulseTimeoutRef.current = window.setTimeout(() => setMicHeard(false), 650);
-    };
-
-    rec.onresult = (event: any) => {
-      pulseMic();
-      let transcript = "";
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const res = event.results[i];
-        const chunk = res?.[0]?.transcript;
-        if (typeof chunk === "string") transcript += ` ${chunk}`;
-      }
-      const t = transcript.toLowerCase();
-      if (t.includes("blind") || t.includes("objects") || t.includes("object")) {
-        speakSystem("Switching to Object Detection mode");
-        chooseMode("blind");
-        try {
-          rec.stop();
-        } catch {
-          // ignore
-        }
-      }
-    };
-
-    rec.onend = () => {
-      // Keep listening while on landing screen (if the browser allows it).
-      if (modeRef.current === null) {
-        try {
-          rec.start();
-        } catch {
-          // ignore (can fail without user gesture)
-        }
-      }
-    };
-
-    try {
-      rec.start();
-    } catch {
-      // ignore (some browsers block auto-start without gesture)
-    }
-
+    if (!listeningEnabled) return;
+    startListening();
     return () => {
-      try {
-        rec.stop();
-      } catch {
-        // ignore
-      }
+      stopListening();
       if (micPulseTimeoutRef.current != null) window.clearTimeout(micPulseTimeoutRef.current);
       micPulseTimeoutRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode]);
+  }, [mode, listeningEnabled]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -449,30 +467,84 @@ export default function Home() {
               const objectResults = od.detectForVideo(video, now);
               lastObjectResultsRef.current = objectResults;
 
-              // Smart TTS: only announce high-confidence objects, debounced + cooldown.
-              const dets = (objectResults as any)?.detections as any[] | undefined;
-              const top = dets?.[0];
-              const cat = top?.categories?.[0];
-              const name =
-                typeof cat?.categoryName === "string"
-                  ? cat.categoryName
-                  : typeof cat?.displayName === "string"
-                    ? cat.displayName
-                    : "";
-              const score = typeof cat?.score === "number" ? cat.score : 0;
+              const dets = ((objectResults as any)?.detections as any[] | undefined) ?? [];
 
-              if (name && score > 0.7) {
-                setCaptionGated(name, now);
+              const mapLabel = (raw: string) => {
+                const n = raw.trim();
+                if (!n) return "";
+                // Desk setup heuristic: common confusion between mouse/remote.
+                if (n.toLowerCase() === "remote") return "Mouse/Remote";
+                return n;
+              };
+
+              const getNameScore = (det: any) => {
+                const cat = det?.categories?.[0];
+                const raw =
+                  typeof cat?.categoryName === "string"
+                    ? cat.categoryName
+                    : typeof cat?.displayName === "string"
+                      ? cat.displayName
+                      : "";
+                const name = mapLabel(raw);
+                const score = typeof cat?.score === "number" ? cat.score : 0;
+                return { name, score };
+              };
+
+              // Captions: show the best non-person object first (if any).
+              // Speech: announce non-person object first, then person only if nothing else qualifies.
+              const speechMinScore = 0.7;
+              const candidates = dets
+                .map((det: any) => {
+                  const { name, score } = getNameScore(det);
+                  const bb = det?.boundingBox;
+                  const area = (bb?.width ?? 0) * (bb?.height ?? 0);
+                  const isPerson = name.toLowerCase() === "person";
+                  return { det, name, score, area, isPerson };
+                })
+                .filter((c: any) => c.name && c.score >= 0.4); // minScore for keeping small objects visible
+
+              const captionTopN = 4;
+              const pickCaptionList = () => {
+                const nonPerson = candidates.filter((c: any) => !c.isPerson);
+                const list = nonPerson.length ? nonPerson : candidates;
+                if (!list.length) return [];
+                // Prefer higher confidence; then smaller objects (helps "mouse under hand").
+                const sorted = [...list].sort((a: any, b: any) => (b.score - a.score) || (a.area - b.area));
+                const names: string[] = [];
+                for (const item of sorted) {
+                  if (!item?.name) continue;
+                  if (names.includes(item.name)) continue; // de-dupe labels
+                  names.push(item.name);
+                  if (names.length >= captionTopN) break;
+                }
+                return names;
+              };
+
+              const captionList = pickCaptionList();
+              const caption = captionList.length ? captionList.join(", ") : "";
+              if (caption) setCaptionGated(caption, now);
+
+              const speakList = candidates
+                .filter((c: any) => c.score >= speechMinScore)
+                .sort((a: any, b: any) => {
+                  // Non-person first
+                  if (a.isPerson !== b.isPerson) return a.isPerson ? 1 : -1;
+                  // Then smaller objects first (helps "mouse under hand" scenarios)
+                  return (a.area - b.area) || (b.score - a.score);
+                });
+
+              const bestToSpeak = speakList[0];
+              if (bestToSpeak?.name) {
                 const cooldownMs = 5000;
                 const lastName = lastSpokenObjectRef.current;
                 const lastAt = lastSpokenObjectAtMsRef.current;
-                const nameChanged = name !== lastName;
+                const nameChanged = bestToSpeak.name !== lastName;
                 const cooledDown = now - lastAt >= cooldownMs;
 
                 if (nameChanged || cooledDown) {
-                  lastSpokenObjectRef.current = name;
+                  lastSpokenObjectRef.current = bestToSpeak.name;
                   lastSpokenObjectAtMsRef.current = now;
-                  speakObject(name);
+                  speakObject(`${bestToSpeak.name} detected`);
                 }
               }
             } catch {
@@ -487,6 +559,13 @@ export default function Home() {
         if (detections && detections.length && video.videoWidth > 0 && video.videoHeight > 0) {
           const sx = canvas.width / video.videoWidth;
           const sy = canvas.height / video.videoHeight;
+
+          const mapLabel = (raw: string) => {
+            const n = raw.trim();
+            if (!n) return "object";
+            if (n.toLowerCase() === "remote") return "Mouse/Remote";
+            return n;
+          };
 
           ctx.save();
           ctx.strokeStyle = "#00ff88";
@@ -509,7 +588,8 @@ export default function Home() {
             ctx.strokeRect(x, y, w, h);
 
             const topCat = det?.categories?.[0];
-            const label = typeof topCat?.categoryName === "string" ? topCat.categoryName : "object";
+            const rawLabel = typeof topCat?.categoryName === "string" ? topCat.categoryName : "object";
+            const label = mapLabel(rawLabel);
             const score = typeof topCat?.score === "number" ? topCat.score : undefined;
             const text = score != null ? `${label} ${(score * 100).toFixed(0)}%` : label;
 
@@ -625,6 +705,22 @@ export default function Home() {
               Sign Language mode is optimized for text. Object Detection mode is optimized for voice.
             </p>
 
+            <button
+              type="button"
+              onClick={() => {
+                setListeningEnabled(true);
+                setSrStatus("Listening for voice commands. Say 'blind' or 'objects'.");
+              }}
+              className="mt-6 w-full rounded-2xl border border-white/10 bg-white/5 px-6 py-4 text-lg font-black shadow-lg transition hover:bg-white/10 active:scale-[0.99]"
+              aria-label="Start Sight2Sound listening"
+            >
+              Start Sight2Sound
+            </button>
+
+            <p className="mt-3 text-sm text-slate-200/70">
+              {listeningEnabled ? (isListening ? "Listening…" : "Listening enabled (waiting for mic)…") : "Click Start to enable voice activation."}
+            </p>
+
             <div className="mt-6 grid grid-cols-1 gap-3">
               <button
                 type="button"
@@ -682,69 +778,82 @@ export default function Home() {
                 Sight2Sound
               </span>
             </h1>
-            <p className="mt-2 text-slate-300/80">
-              Real-time sign-to-speech with on-device landmark logic.
+            <p className="mt-2 text-slate-300/70">
+              {mode === "deaf" ? "Sign Language Mode" : mode === "blind" ? "Object Detection Mode" : "Choose a mode to begin"}
             </p>
           </div>
 
           <div className="flex items-center gap-3">
-            <div className="rounded-full border border-white/10 bg-white/5 px-4 py-2 backdrop-blur-xl">
-              <p className="text-xs font-mono tracking-widest text-slate-200/80">
-                STATUS: <span className={handDetected ? "text-emerald-300" : "text-slate-300"}>{handDetected ? "HAND DETECTED" : "IDLE"}</span>
-              </p>
-            </div>
             <button
-              onClick={startCamera}
-              className="rounded-full bg-gradient-to-r from-sky-500 to-violet-500 px-6 py-3 font-bold shadow-lg shadow-sky-500/20 transition hover:brightness-110 active:scale-[0.98]"
+              type="button"
+              onClick={() => setMode(null)}
+              className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-semibold text-slate-100/90 backdrop-blur-md hover:bg-white/10"
+              aria-label="Go to home (mode selection)"
             >
-              Start Camera
+              <HomeIcon className="h-4 w-4" />
+              Home
             </button>
           </div>
         </div>
 
         <div className="mt-8 grid grid-cols-1 gap-6 lg:grid-cols-12">
           <div className="lg:col-span-7">
-            <div className="relative overflow-hidden rounded-3xl border border-white/10 bg-white/5 backdrop-blur-xl shadow-2xl">
-              <div className="pointer-events-none absolute inset-0 rounded-3xl ring-2 ring-sky-400/30 shadow-[0_0_40px_rgba(56,189,248,0.25)]" />
-              <div className="relative aspect-video">
+            <div className="relative mx-auto w-full max-w-3xl overflow-hidden rounded-2xl border border-white/10 bg-white/5 backdrop-blur-xl shadow-2xl">
+              <div className="pointer-events-none absolute inset-0 rounded-2xl ring-1 ring-white/10 shadow-[0_0_55px_rgba(56,189,248,0.18)]" />
+              <div className="relative aspect-video flex items-center justify-center">
                 <video ref={videoRef} autoPlay playsInline className="absolute inset-0 h-full w-full object-cover mirror" />
                 <canvas ref={canvasRef} width={640} height={360} className="absolute inset-0 h-full w-full pointer-events-none" />
 
-                {/* Performance Overlay */}
-                <div className="absolute right-3 top-3 flex items-start gap-2">
-                  <div className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 backdrop-blur-md">
-                    <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-200/70">Performance</p>
-                    <p className="mt-0.5 text-sm font-mono text-slate-100">{fps} FPS</p>
+                {/* Mode badge */}
+                {mode && (
+                  <div className="absolute right-3 top-3 inline-flex items-center gap-2 rounded-full border border-white/10 bg-black/40 px-3 py-1.5 backdrop-blur-md">
+                    <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+                    <span className="text-[11px] font-semibold tracking-widest text-slate-100/90">
+                      LIVE: {mode === "deaf" ? "DEAF MODE" : "BLIND MODE"}
+                    </span>
                   </div>
+                )}
+
+                {/* Controls */}
+                <div className="absolute left-3 bottom-3 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={startCamera}
+                    className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-black/40 px-3 py-2 text-xs font-semibold text-slate-100 backdrop-blur-md hover:bg-black/50"
+                    aria-label="Start camera"
+                  >
+                    <MicIcon className="h-4 w-4" />
+                    Start
+                  </button>
+
                   <button
                     type="button"
                     onClick={() => setIsMuted((m) => !m)}
-                    className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-xs font-semibold text-slate-100 backdrop-blur-md hover:bg-black/50"
+                    className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-black/40 px-3 py-2 text-xs font-semibold text-slate-100 backdrop-blur-md hover:bg-black/50 disabled:opacity-40"
                     aria-pressed={isMuted}
                     aria-label={isMuted ? "Unmute voice guidance" : "Mute voice guidance"}
+                    disabled={mode !== "blind"}
                   >
-                    {isMuted ? "Unmute" : "Mute"}
+                    {isMuted ? <VolumeOffIcon className="h-4 w-4" /> : <VolumeIcon className="h-4 w-4" />}
+                    {isMuted ? "Muted" : "Voice"}
                   </button>
                 </div>
 
                 {/* Microphone activity indicator (visual feedback when voice is detected) */}
                 {micHeard && (
                   <div className="absolute left-3 top-3 grid h-10 w-10 place-items-center rounded-2xl border border-white/10 bg-black/40 backdrop-blur-md" aria-hidden="true">
-                    <div className="h-3 w-3 rounded-full bg-emerald-400 shadow-[0_0_18px_rgba(16,185,129,0.85)] animate-pulse" />
+                    <MicIcon className="h-5 w-5 text-emerald-300 animate-pulse" />
                   </div>
                 )}
               </div>
 
-              {/* Live Captions */}
-              <div
-                className="border-t border-white/10 bg-black/20 px-5 py-4"
-                aria-live="polite"
-                aria-label="Live captions"
-              >
-                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-300/70">Live Captions</p>
-                <p className="mt-2 text-2xl font-black tracking-tight text-slate-50">
-                  {mode === "blind" ? (liveCaption || "—") : (translation || "—")}
-                </p>
+              {/* Floating Translation Card */}
+              <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center px-3">
+                <div className="w-full max-w-xl rounded-2xl border border-white/15 bg-white/10 px-6 py-4 backdrop-blur-md shadow-[0_0_30px_rgba(0,255,136,0.10)]">
+                  <p className="text-center text-4xl font-black tracking-tight text-emerald-300 drop-shadow-[0_0_12px_rgba(0,255,136,0.25)]">
+                    {mode === "blind" ? (liveCaption || "—") : (translation || "—")}
+                  </p>
+                </div>
               </div>
 
               <div className="border-t border-white/10 p-5">
@@ -785,16 +894,7 @@ export default function Home() {
                 </p>
               </div>
 
-              <div className="mt-6 grid grid-cols-2 gap-3 text-sm">
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <p className="text-slate-200/80 font-semibold">PEACE</p>
-                  <p className="mt-1 text-slate-200/60">Index & middle tips close</p>
-                </div>
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <p className="text-slate-200/80 font-semibold">HELLO</p>
-                  <p className="mt-1 text-slate-200/60">All tips above bases</p>
-                </div>
-              </div>
+              {/* Clean UI: remove technical hints */}
             </div>
           </div>
         </div>
