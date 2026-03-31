@@ -1,11 +1,12 @@
 "use client";
 import { useEffect, useRef, useState } from 'react';
-import { HandLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+import { HandLandmarker, FilesetResolver, ObjectDetector } from "@mediapipe/tasks-vision";
 
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [landmarker, setLandmarker] = useState<HandLandmarker | null>(null);
+  const [objectDetector, setObjectDetector] = useState<ObjectDetector | null>(null);
   const [translation, setTranslation] = useState("Waiting for gesture...");
   const [confidence, setConfidence] = useState(0);
   const [handDetected, setHandDetected] = useState(false);
@@ -17,6 +18,8 @@ export default function Home() {
   const frameCountRef = useRef(0);
   const lastFpsSampleMsRef = useRef(0);
   const lastFpsUiUpdateMsRef = useRef(0);
+  const lastObjectDetectMsRef = useRef(0);
+  const lastObjectResultsRef = useRef<any>(null);
   const pendingUiRef = useRef<{ translation: string; confidence: number; handDetected: boolean }>({
     translation: "Waiting for gesture...",
     confidence: 0,
@@ -38,6 +41,18 @@ export default function Home() {
         numHands: 1
       });
       setLandmarker(hl);
+
+      // ObjectDetector init (runs once)
+      const od = await ObjectDetector.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite",
+          delegate: "GPU",
+        },
+        runningMode: "VIDEO",
+        scoreThreshold: 0.35,
+        maxResults: 5,
+      });
+      setObjectDetector(od);
     };
     initVision();
   }, []);
@@ -70,6 +85,101 @@ export default function Home() {
       return Math.sqrt(ddx * ddx + ddy * ddy);
     };
 
+    const higherThan = (tipIdx: number, baseIdx: number, t: number) => {
+      const tip = p(tipIdx);
+      const base = p(baseIdx);
+      if (!tip || !base) return false;
+      return base.y - tip.y > t; // smaller y = higher
+    };
+    const folded = (tipIdx: number, baseIdx: number, t: number) => {
+      const tip = p(tipIdx);
+      const base = p(baseIdx);
+      if (!tip || !base) return false;
+      return tip.y - base.y > t;
+    };
+
+    // Common thresholds
+    const upT = 0.06 * dy;
+    const foldT = 0.04 * dy;
+
+    // Helper groups
+    const indexUp = higherThan(8, 6, upT);
+    const middleUp = higherThan(12, 10, upT);
+    const ringUp = higherThan(16, 14, upT);
+    const pinkyUp = higherThan(20, 18, upT);
+
+    const indexFolded = folded(8, 6, foldT);
+    const middleFolded = folded(12, 10, foldT);
+    const ringFolded = folded(16, 14, foldT);
+    const pinkyFolded = folded(20, 18, foldT);
+
+    const thumbTip = p(4);
+    const thumbIp = p(3);
+    const thumbMcp = p(2);
+    const indexKnuckle = p(5);
+    const indexTip = p(8);
+
+    // --- ASL alphabet (simple heuristics) ---
+    // A: all fingers folded + thumb tip to the right of index knuckle (5).
+    if (thumbTip && indexKnuckle && indexFolded && middleFolded && ringFolded && pinkyFolded && thumbTip.x > indexKnuckle.x) {
+      return { translation: "A", confidence: 0.82, handDetected: true };
+    }
+
+    // B: four fingers up + thumb folded across palm.
+    // Heuristic: index/middle/ring/pinky up AND thumb tip sits left of index knuckle (across palm) and near palm center.
+    const palmCenter = p(9);
+    const thumbAcross =
+      Boolean(thumbTip && indexKnuckle && palmCenter) &&
+      thumbTip.x < indexKnuckle.x &&
+      dist(thumbTip!, palmCenter!) < 0.35 * diag;
+    if (indexUp && middleUp && ringUp && pinkyUp && thumbAcross) {
+      return { translation: "B", confidence: 0.83, handDetected: true };
+    }
+
+    // L: Index up and thumb extended sideways (forming an L).
+    // Heuristic: index up, middle/ring/pinky folded, and thumb far from palm center horizontally.
+    const thumbExtendedSideways =
+      Boolean(thumbTip && thumbMcp && palmCenter) &&
+      Math.abs(thumbTip.x - thumbMcp!.x) > 0.18 * dx &&
+      Math.abs(thumbTip.y - thumbMcp!.y) < 0.22 * dy &&
+      dist(thumbTip!, palmCenter!) > 0.25 * diag;
+    if (indexUp && middleFolded && ringFolded && pinkyFolded && thumbExtendedSideways) {
+      return { translation: "L", confidence: 0.84, handDetected: true };
+    }
+
+    // C: "curved" fingers forming a C shape.
+    // Heuristic: index/middle/ring/pinky tips lie between their knuckles (MCP) and bases (PIP) in y (neither fully up nor fully folded),
+    // and fingertips are spread (not touching like O).
+    const between = (tipIdx: number, knuckleIdx: number, baseIdx: number) => {
+      const tip = p(tipIdx);
+      const kn = p(knuckleIdx);
+      const base = p(baseIdx);
+      if (!tip || !kn || !base) return false;
+      const lo = Math.min(kn.y, base.y);
+      const hi = Math.max(kn.y, base.y);
+      return tip.y > lo + 0.01 * dy && tip.y < hi - 0.01 * dy;
+    };
+    const cLike =
+      between(8, 5, 6) &&
+      between(12, 9, 10) &&
+      between(16, 13, 14) &&
+      between(20, 17, 18) &&
+      Boolean(thumbTip && indexTip) &&
+      dist(thumbTip!, indexTip!) > 0.16 * diag;
+    if (cLike) return { translation: "C", confidence: 0.78, handDetected: true };
+
+    // O (optional, per your note): thumb touching index/middle tip using distance formula.
+    // This helps later letters too; keep it above PEACE/HELLO so "O" doesn't get misread.
+    if (thumbTip) {
+      const tToIndex = indexTip ? dist(thumbTip, indexTip) : Infinity;
+      const tToMiddle = midTip ? dist(thumbTip, midTip) : Infinity;
+      const touchT = 0.14 * diag;
+      if (Math.min(tToIndex, tToMiddle) < touchT) {
+        const c = Math.min(1, Math.max(0, 1 - Math.min(tToIndex, tToMiddle) / touchT));
+        return { translation: "O", confidence: 0.7 + 0.25 * c, handDetected: true };
+      }
+    }
+
     // Rule 1: PEACE if index tip and middle tip are close together.
     const tipDist = dist(idxTip, midTip);
     const peaceThreshold = 0.18 * diag;
@@ -84,7 +194,7 @@ export default function Home() {
       const tip = p(tipIdx);
       const base = p(baseIdx);
       if (!tip || !base) return false;
-      return base.y - tip.y > 0.06 * dy; // smaller y = higher
+      return base.y - tip.y > upT; // smaller y = higher
     };
 
     const allUp =
@@ -144,13 +254,78 @@ export default function Home() {
     const video = videoRef.current;
     const canvas = canvasRef.current;
     const hl = landmarker;
+    const od = objectDetector;
     if (hl && video && canvas) {
-      const results = hl.detectForVideo(video, performance.now());
+      const results = hl.detectForVideo(video, now);
       const ctx = canvas.getContext("2d");
 
       if (ctx) {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         const currentLandmarks = results?.landmarks?.[0];
+
+        // Object detection (throttled to keep 30-60 FPS)
+        if (od && video.videoWidth > 0 && video.videoHeight > 0) {
+          const detectEveryMs = 120; // ~8fps for objects; adjust as needed
+          if (now - lastObjectDetectMsRef.current >= detectEveryMs) {
+            lastObjectDetectMsRef.current = now;
+            try {
+              lastObjectResultsRef.current = od.detectForVideo(video, now);
+            } catch {
+              // ignore transient detector errors
+            }
+          }
+        }
+
+        // Draw object boxes (neon green)
+        const objectResults = lastObjectResultsRef.current;
+        const detections = objectResults?.detections as any[] | undefined;
+        if (detections && detections.length && video.videoWidth > 0 && video.videoHeight > 0) {
+          const sx = canvas.width / video.videoWidth;
+          const sy = canvas.height / video.videoHeight;
+
+          ctx.save();
+          ctx.strokeStyle = "#00ff88";
+          ctx.lineWidth = 3;
+          ctx.shadowColor = "rgba(0,255,136,0.55)";
+          ctx.shadowBlur = 16;
+          ctx.font = "14px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
+
+          for (const det of detections) {
+            const bb = det?.boundingBox;
+            if (!bb) continue;
+
+            const x = (bb.originX ?? 0) * sx;
+            const y = (bb.originY ?? 0) * sy;
+            const w = (bb.width ?? 0) * sx;
+            const h = (bb.height ?? 0) * sy;
+            if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(w) || !Number.isFinite(h)) continue;
+            if (w <= 1 || h <= 1) continue;
+
+            ctx.strokeRect(x, y, w, h);
+
+            const topCat = det?.categories?.[0];
+            const label = typeof topCat?.categoryName === "string" ? topCat.categoryName : "object";
+            const score = typeof topCat?.score === "number" ? topCat.score : undefined;
+            const text = score != null ? `${label} ${(score * 100).toFixed(0)}%` : label;
+
+            const padX = 8;
+            const padY = 6;
+            const textW = ctx.measureText(text).width;
+            const boxW = textW + padX * 2;
+            const boxH = 22;
+            const tx = x;
+            const ty = Math.max(0, y - boxH - 6);
+
+            ctx.fillStyle = "rgba(0,255,136,0.14)";
+            ctx.fillRect(tx, ty, boxW, boxH);
+            ctx.strokeRect(tx, ty, boxW, boxH);
+            ctx.fillStyle = "rgba(231,255,245,0.95)";
+            ctx.shadowBlur = 0;
+            ctx.fillText(text, tx + padX, ty + 16);
+            ctx.shadowBlur = 16;
+          }
+          ctx.restore();
+        }
 
         if (currentLandmarks && currentLandmarks.length >= 21) {
           // Draw the dots (lightweight).
