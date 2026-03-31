@@ -7,10 +7,15 @@ export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [landmarker, setLandmarker] = useState<HandLandmarker | null>(null);
   const [objectDetector, setObjectDetector] = useState<ObjectDetector | null>(null);
+  const [mode, setMode] = useState<null | "deaf" | "blind">(null);
   const [translation, setTranslation] = useState("Waiting for gesture...");
   const [confidence, setConfidence] = useState(0);
   const [handDetected, setHandDetected] = useState(false);
   const [fps, setFps] = useState(0);
+  const [isMuted, setIsMuted] = useState(false);
+  const [modelsReady, setModelsReady] = useState(false);
+  const [srStatus, setSrStatus] = useState("Loading AI systems…");
+  const [liveCaption, setLiveCaption] = useState("");
   const rafIdRef = useRef<number | null>(null);
   const runningRef = useRef(false);
   const lastSpokenRef = useRef<string>("");
@@ -20,6 +25,11 @@ export default function Home() {
   const lastFpsUiUpdateMsRef = useRef(0);
   const lastObjectDetectMsRef = useRef(0);
   const lastObjectResultsRef = useRef<any>(null);
+  const lastSpokenObjectRef = useRef<string>("");
+  const lastSpokenObjectAtMsRef = useRef(0);
+  const lastCaptionRef = useRef<string>("");
+  const lastCaptionAtMsRef = useRef(0);
+  const lastHoverPromptAtMsRef = useRef(0);
   const pendingUiRef = useRef<{ translation: string; confidence: number; handDetected: boolean }>({
     translation: "Waiting for gesture...",
     confidence: 0,
@@ -53,9 +63,33 @@ export default function Home() {
         maxResults: 5,
       });
       setObjectDetector(od);
+
+      setModelsReady(true);
+      setSrStatus("AI systems are ready.");
     };
     initVision();
   }, []);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase();
+      if (tag === "input" || tag === "textarea" || (target as any)?.isContentEditable) return;
+
+      const key = e.key.toLowerCase();
+      if (key === "m") {
+        e.preventDefault();
+        setIsMuted((m) => !m);
+      } else if (key === "s") {
+        e.preventDefault();
+        if (mode) startCamera();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, modelsReady]);
 
   const classifyGesture = (landmarks: Array<{ x: number; y: number; z?: number }> | undefined) => {
     if (!landmarks || landmarks.length < 21) return { translation: "Waiting for gesture...", confidence: 0, handDetected: false };
@@ -219,16 +253,29 @@ export default function Home() {
     setTranslation(next.translation);
     setConfidence(next.confidence);
     setHandDetected(next.handDetected);
+  };
 
-    if (next.translation && next.translation !== lastSpokenRef.current && next.translation !== "Waiting for gesture...") {
-      lastSpokenRef.current = next.translation;
-      try {
-        window.speechSynthesis.cancel();
-        window.speechSynthesis.speak(new SpeechSynthesisUtterance(next.translation));
-      } catch {
-        // ignore TTS failures
-      }
+  const speakObject = (name: string) => {
+    if (mode !== "blind") return;
+    if (isMuted) return;
+    if (!name) return;
+    try {
+      // If something is already speaking, don't interrupt (prevents chattiness).
+      if (window.speechSynthesis.speaking) return;
+      window.speechSynthesis.speak(new SpeechSynthesisUtterance(name));
+    } catch {
+      // ignore TTS failures
     }
+  };
+
+  const setCaptionGated = (caption: string, now: number) => {
+    // Gate caption updates so they don't spam React.
+    const minMs = 100;
+    if (caption === lastCaptionRef.current && now - lastCaptionAtMsRef.current < 1000) return;
+    if (now - lastCaptionAtMsRef.current < minMs) return;
+    lastCaptionRef.current = caption;
+    lastCaptionAtMsRef.current = now;
+    setLiveCaption(caption);
   };
 
   // 3. The Vision Loop
@@ -255,8 +302,8 @@ export default function Home() {
     const canvas = canvasRef.current;
     const hl = landmarker;
     const od = objectDetector;
-    if (hl && video && canvas) {
-      const results = hl.detectForVideo(video, now);
+    if (video && canvas) {
+      const results = mode === "deaf" && hl ? hl.detectForVideo(video, now) : null;
       const ctx = canvas.getContext("2d");
 
       if (ctx) {
@@ -264,12 +311,40 @@ export default function Home() {
         const currentLandmarks = results?.landmarks?.[0];
 
         // Object detection (throttled to keep 30-60 FPS)
-        if (od && video.videoWidth > 0 && video.videoHeight > 0) {
+        if (mode === "blind" && od && video.videoWidth > 0 && video.videoHeight > 0) {
           const detectEveryMs = 120; // ~8fps for objects; adjust as needed
           if (now - lastObjectDetectMsRef.current >= detectEveryMs) {
             lastObjectDetectMsRef.current = now;
             try {
-              lastObjectResultsRef.current = od.detectForVideo(video, now);
+              const objectResults = od.detectForVideo(video, now);
+              lastObjectResultsRef.current = objectResults;
+
+              // Smart TTS: only announce high-confidence objects, debounced + cooldown.
+              const dets = (objectResults as any)?.detections as any[] | undefined;
+              const top = dets?.[0];
+              const cat = top?.categories?.[0];
+              const name =
+                typeof cat?.categoryName === "string"
+                  ? cat.categoryName
+                  : typeof cat?.displayName === "string"
+                    ? cat.displayName
+                    : "";
+              const score = typeof cat?.score === "number" ? cat.score : 0;
+
+              if (name && score > 0.7) {
+                setCaptionGated(name, now);
+                const cooldownMs = 5000;
+                const lastName = lastSpokenObjectRef.current;
+                const lastAt = lastSpokenObjectAtMsRef.current;
+                const nameChanged = name !== lastName;
+                const cooledDown = now - lastAt >= cooldownMs;
+
+                if (nameChanged || cooledDown) {
+                  lastSpokenObjectRef.current = name;
+                  lastSpokenObjectAtMsRef.current = now;
+                  speakObject(name);
+                }
+              }
             } catch {
               // ignore transient detector errors
             }
@@ -278,7 +353,7 @@ export default function Home() {
 
         // Draw object boxes (neon green)
         const objectResults = lastObjectResultsRef.current;
-        const detections = objectResults?.detections as any[] | undefined;
+        const detections = mode === "blind" ? (objectResults?.detections as any[] | undefined) : undefined;
         if (detections && detections.length && video.videoWidth > 0 && video.videoHeight > 0) {
           const sx = canvas.width / video.videoWidth;
           const sy = canvas.height / video.videoHeight;
@@ -327,7 +402,7 @@ export default function Home() {
           ctx.restore();
         }
 
-        if (currentLandmarks && currentLandmarks.length >= 21) {
+        if (mode === "deaf" && currentLandmarks && currentLandmarks.length >= 21) {
           // Draw the dots (lightweight).
           ctx.fillStyle = "#60a5fa";
           for (const point of currentLandmarks) {
@@ -339,7 +414,13 @@ export default function Home() {
           const classified = classifyGesture(currentLandmarks);
           pendingUiRef.current = classified;
         } else {
-          pendingUiRef.current = { translation: "Waiting for gesture...", confidence: 0, handDetected: false };
+          // In blind mode, we keep captions for objects; in deaf mode we reset.
+          if (mode === "deaf") {
+            pendingUiRef.current = { translation: "Waiting for gesture...", confidence: 0, handDetected: false };
+          } else {
+            pendingUiRef.current = { translation, confidence, handDetected };
+          }
+          if (mode !== "blind") setCaptionGated("", now);
         }
 
         commitUiFromPending();
@@ -352,6 +433,10 @@ export default function Home() {
 
   const startCamera = async () => {
     if (runningRef.current) return;
+    if (!modelsReady) {
+      setSrStatus("Loading AI systems…");
+      return;
+    }
     runningRef.current = true;
 
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -384,6 +469,82 @@ export default function Home() {
 
   return (
     <main className="min-h-screen text-white bg-[radial-gradient(1200px_circle_at_20%_10%,rgba(59,130,246,0.25),transparent_55%),radial-gradient(900px_circle_at_90%_20%,rgba(168,85,247,0.25),transparent_55%),radial-gradient(800px_circle_at_40%_90%,rgba(16,185,129,0.18),transparent_55%),linear-gradient(to_bottom,#020617,#030712)]">
+      {/* Screen-reader announcements */}
+      <div className="sr-only" aria-live="polite">
+        {srStatus}
+      </div>
+
+      {mode === null && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/70 backdrop-blur-xl">
+          <div className="mx-auto w-full max-w-lg rounded-3xl border border-white/10 bg-white/5 p-8 text-center shadow-2xl">
+            <h2 className="text-3xl font-black tracking-tight">
+              <span className="bg-gradient-to-r from-sky-300 via-blue-400 to-violet-400 bg-clip-text text-transparent">
+                Choose Mode
+              </span>
+            </h2>
+            <p className="mt-3 text-slate-200/70">
+              Sign Language mode is optimized for text. Object Detection mode is optimized for voice.
+            </p>
+
+            <div className="mt-6 grid grid-cols-1 gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setMode("deaf");
+                  setIsMuted(true); // disable Speech API in deaf mode
+                  setSrStatus(modelsReady ? "Sign Language mode selected." : "Loading AI systems…");
+                  startCamera();
+                }}
+                className="w-full rounded-2xl bg-gradient-to-r from-sky-500 to-blue-600 px-6 py-4 text-lg font-black shadow-lg shadow-sky-500/20 transition hover:brightness-110 active:scale-[0.99]"
+                aria-describedby="ai-ready-hint"
+              >
+                Sign Language Mode
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setMode("blind");
+                  setIsMuted(false); // enable Speech API in blind mode
+                  setSrStatus(modelsReady ? "Object Detection mode selected." : "Loading AI systems…");
+                  startCamera();
+                }}
+                onMouseEnter={() => {
+                  const now = performance.now();
+                  if (now - lastHoverPromptAtMsRef.current < 2000) return;
+                  lastHoverPromptAtMsRef.current = now;
+                  try {
+                    window.speechSynthesis.cancel();
+                    window.speechSynthesis.speak(new SpeechSynthesisUtterance("Object Detection Mode"));
+                  } catch {
+                    // ignore TTS failures
+                  }
+                }}
+                onFocus={() => {
+                  const now = performance.now();
+                  if (now - lastHoverPromptAtMsRef.current < 2000) return;
+                  lastHoverPromptAtMsRef.current = now;
+                  try {
+                    window.speechSynthesis.cancel();
+                    window.speechSynthesis.speak(new SpeechSynthesisUtterance("Object Detection Mode"));
+                  } catch {
+                    // ignore TTS failures
+                  }
+                }}
+                className="w-full rounded-2xl bg-gradient-to-r from-violet-500 to-emerald-500 px-6 py-4 text-lg font-black shadow-lg shadow-violet-500/20 transition hover:brightness-110 active:scale-[0.99]"
+                aria-describedby="ai-ready-hint"
+              >
+                Object Detection Mode
+              </button>
+            </div>
+
+            <p id="ai-ready-hint" className="mt-3 text-sm text-slate-200/60">
+              {modelsReady ? "AI systems are ready." : "Loading AI systems…"}
+            </p>
+          </div>
+        </div>
+      )}
+
       <div className="mx-auto max-w-6xl px-6 py-10">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
           <div>
@@ -421,10 +582,33 @@ export default function Home() {
                 <canvas ref={canvasRef} width={640} height={360} className="absolute inset-0 h-full w-full pointer-events-none" />
 
                 {/* Performance Overlay */}
-                <div className="absolute right-3 top-3 rounded-xl border border-white/10 bg-black/40 px-3 py-2 backdrop-blur-md">
-                  <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-200/70">Performance</p>
-                  <p className="mt-0.5 text-sm font-mono text-slate-100">{fps} FPS</p>
+                <div className="absolute right-3 top-3 flex items-start gap-2">
+                  <div className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 backdrop-blur-md">
+                    <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-200/70">Performance</p>
+                    <p className="mt-0.5 text-sm font-mono text-slate-100">{fps} FPS</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsMuted((m) => !m)}
+                    className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-xs font-semibold text-slate-100 backdrop-blur-md hover:bg-black/50"
+                    aria-pressed={isMuted}
+                    aria-label={isMuted ? "Unmute voice guidance" : "Mute voice guidance"}
+                  >
+                    {isMuted ? "Unmute" : "Mute"}
+                  </button>
                 </div>
+              </div>
+
+              {/* Live Captions */}
+              <div
+                className="border-t border-white/10 bg-black/20 px-5 py-4"
+                aria-live="polite"
+                aria-label="Live captions"
+              >
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-300/70">Live Captions</p>
+                <p className="mt-2 text-2xl font-black tracking-tight text-slate-50">
+                  {mode === "blind" ? (liveCaption || "—") : (translation || "—")}
+                </p>
               </div>
 
               <div className="border-t border-white/10 p-5">
