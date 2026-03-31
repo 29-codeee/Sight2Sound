@@ -16,6 +16,10 @@ export default function Home() {
   const [modelsReady, setModelsReady] = useState(false);
   const [srStatus, setSrStatus] = useState("Loading AI systems…");
   const [liveCaption, setLiveCaption] = useState("");
+  const modeRef = useRef<null | "deaf" | "blind">(null);
+  const mutedRef = useRef(false);
+  const landmarkerRef = useRef<HandLandmarker | null>(null);
+  const objectDetectorRef = useRef<ObjectDetector | null>(null);
   const rafIdRef = useRef<number | null>(null);
   const runningRef = useRef(false);
   const lastSpokenRef = useRef<string>("");
@@ -50,6 +54,7 @@ export default function Home() {
         runningMode: "VIDEO",
         numHands: 1
       });
+      landmarkerRef.current = hl;
       setLandmarker(hl);
 
       // ObjectDetector init (runs once)
@@ -62,6 +67,7 @@ export default function Home() {
         scoreThreshold: 0.35,
         maxResults: 5,
       });
+      objectDetectorRef.current = od;
       setObjectDetector(od);
 
       setModelsReady(true);
@@ -69,6 +75,14 @@ export default function Home() {
     };
     initVision();
   }, []);
+
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+
+  useEffect(() => {
+    mutedRef.current = isMuted;
+  }, [isMuted]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -82,7 +96,7 @@ export default function Home() {
         setIsMuted((m) => !m);
       } else if (key === "s") {
         e.preventDefault();
-        if (mode) startCamera();
+        if (modeRef.current) startCamera();
       }
     };
 
@@ -256,8 +270,8 @@ export default function Home() {
   };
 
   const speakObject = (name: string) => {
-    if (mode !== "blind") return;
-    if (isMuted) return;
+    if (modeRef.current !== "blind") return;
+    if (mutedRef.current) return;
     if (!name) return;
     try {
       // If something is already speaking, don't interrupt (prevents chattiness).
@@ -300,10 +314,11 @@ export default function Home() {
 
     const video = videoRef.current;
     const canvas = canvasRef.current;
-    const hl = landmarker;
-    const od = objectDetector;
+    const currentMode = modeRef.current;
+    const hl = landmarkerRef.current;
+    const od = objectDetectorRef.current;
     if (video && canvas) {
-      const results = mode === "deaf" && hl ? hl.detectForVideo(video, now) : null;
+      const results = currentMode === "deaf" && hl ? hl.detectForVideo(video, now) : null;
       const ctx = canvas.getContext("2d");
 
       if (ctx) {
@@ -311,7 +326,7 @@ export default function Home() {
         const currentLandmarks = results?.landmarks?.[0];
 
         // Object detection (throttled to keep 30-60 FPS)
-        if (mode === "blind" && od && video.videoWidth > 0 && video.videoHeight > 0) {
+        if (currentMode === "blind" && od && video.videoWidth > 0 && video.videoHeight > 0) {
           const detectEveryMs = 120; // ~8fps for objects; adjust as needed
           if (now - lastObjectDetectMsRef.current >= detectEveryMs) {
             lastObjectDetectMsRef.current = now;
@@ -353,7 +368,7 @@ export default function Home() {
 
         // Draw object boxes (neon green)
         const objectResults = lastObjectResultsRef.current;
-        const detections = mode === "blind" ? (objectResults?.detections as any[] | undefined) : undefined;
+        const detections = currentMode === "blind" ? (objectResults?.detections as any[] | undefined) : undefined;
         if (detections && detections.length && video.videoWidth > 0 && video.videoHeight > 0) {
           const sx = canvas.width / video.videoWidth;
           const sy = canvas.height / video.videoHeight;
@@ -402,7 +417,7 @@ export default function Home() {
           ctx.restore();
         }
 
-        if (mode === "deaf" && currentLandmarks && currentLandmarks.length >= 21) {
+        if (currentMode === "deaf" && currentLandmarks && currentLandmarks.length >= 21) {
           // Draw the dots (lightweight).
           ctx.fillStyle = "#60a5fa";
           for (const point of currentLandmarks) {
@@ -415,12 +430,12 @@ export default function Home() {
           pendingUiRef.current = classified;
         } else {
           // In blind mode, we keep captions for objects; in deaf mode we reset.
-          if (mode === "deaf") {
+          if (currentMode === "deaf") {
             pendingUiRef.current = { translation: "Waiting for gesture...", confidence: 0, handDetected: false };
           } else {
             pendingUiRef.current = { translation, confidence, handDetected };
           }
-          if (mode !== "blind") setCaptionGated("", now);
+          if (currentMode !== "blind") setCaptionGated("", now);
         }
 
         commitUiFromPending();
@@ -450,6 +465,15 @@ export default function Home() {
       };
     }
   };
+
+  // If user picks a mode before models finish loading, start camera once ready.
+  useEffect(() => {
+    if (!modelsReady) return;
+    if (!modeRef.current) return;
+    if (runningRef.current) return;
+    startCamera();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modelsReady, mode]);
 
   useEffect(() => {
     return () => {
