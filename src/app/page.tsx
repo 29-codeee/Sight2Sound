@@ -9,10 +9,14 @@ export default function Home() {
   const [translation, setTranslation] = useState("Waiting for gesture...");
   const [confidence, setConfidence] = useState(0);
   const [handDetected, setHandDetected] = useState(false);
+  const [fps, setFps] = useState(0);
   const rafIdRef = useRef<number | null>(null);
   const runningRef = useRef(false);
   const lastSpokenRef = useRef<string>("");
   const lastUiUpdateMsRef = useRef(0);
+  const frameCountRef = useRef(0);
+  const lastFpsSampleMsRef = useRef(0);
+  const lastFpsUiUpdateMsRef = useRef(0);
   const pendingUiRef = useRef<{ translation: string; confidence: number; handDetected: boolean }>({
     translation: "Waiting for gesture...",
     confidence: 0,
@@ -121,6 +125,22 @@ export default function Home() {
   const predict = () => {
     if (!runningRef.current) return;
 
+    const now = performance.now();
+    // FPS sampling (cheap, no allocations). Update overlay a few times per second.
+    if (lastFpsSampleMsRef.current === 0) lastFpsSampleMsRef.current = now;
+    frameCountRef.current += 1;
+    const sampleWindowMs = 500;
+    if (now - lastFpsSampleMsRef.current >= sampleWindowMs) {
+      const fpsNow = Math.round((frameCountRef.current * 1000) / (now - lastFpsSampleMsRef.current));
+      frameCountRef.current = 0;
+      lastFpsSampleMsRef.current = now;
+      // Gate FPS state too so React doesn't churn.
+      if (now - lastFpsUiUpdateMsRef.current >= 250) {
+        lastFpsUiUpdateMsRef.current = now;
+        setFps(fpsNow);
+      }
+    }
+
     const video = videoRef.current;
     const canvas = canvasRef.current;
     const hl = landmarker;
@@ -160,7 +180,7 @@ export default function Home() {
     runningRef.current = true;
 
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: "user", frameRate: { ideal: 60, max: 60 } },
+      video: { facingMode: "user", frameRate: { ideal: 60 } },
       audio: false,
     });
     if (videoRef.current) {
@@ -176,6 +196,7 @@ export default function Home() {
       runningRef.current = false;
       if (rafIdRef.current != null) cancelAnimationFrame(rafIdRef.current);
       rafIdRef.current = null;
+      if (videoRef.current) videoRef.current.onloadeddata = null;
 
       const video = videoRef.current;
       const stream = video?.srcObject as MediaStream | null;
@@ -223,6 +244,12 @@ export default function Home() {
               <div className="relative aspect-video">
                 <video ref={videoRef} autoPlay playsInline className="absolute inset-0 h-full w-full object-cover mirror" />
                 <canvas ref={canvasRef} width={640} height={360} className="absolute inset-0 h-full w-full pointer-events-none" />
+
+                {/* Performance Overlay */}
+                <div className="absolute right-3 top-3 rounded-xl border border-white/10 bg-black/40 px-3 py-2 backdrop-blur-md">
+                  <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-200/70">Performance</p>
+                  <p className="mt-0.5 text-sm font-mono text-slate-100">{fps} FPS</p>
+                </div>
               </div>
 
               <div className="border-t border-white/10 p-5">
